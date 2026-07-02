@@ -63,7 +63,8 @@ SubPipelines:
     modules/trace_viewer,
     modules/power_clust,
     modules/voltage_clust,
-    modules/stimpulse_finder
+    modules/stimpulse_finder,
+    modules/stim_artifact_removal
 InteractiveModules:
     modules/import_lfp_native,
     modules/import_signals,
@@ -89,4 +90,5 @@ InteractiveModules:
     modules/power_clust,
     modules/voltage_clust,
     modules/stimpulse_finder,
+    modules/stim_artifact_removal,
     modules/project_overview

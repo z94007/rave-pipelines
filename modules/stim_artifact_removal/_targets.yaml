@@ -1,0 +1,5 @@
+stim_artifact_removal:
+  script: make-main.R
+  store: shared
+  reporter_make: terse
+  reporter_outdated: terse

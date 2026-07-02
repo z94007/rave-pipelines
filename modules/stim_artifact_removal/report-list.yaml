@@ -1,0 +1,4 @@
+- name: stimRemoval
+  label: Stim Artifact Removal Report
+  entry: report-stim_removal.Rmd
+  fork_policy: report

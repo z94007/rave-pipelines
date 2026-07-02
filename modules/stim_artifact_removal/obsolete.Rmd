@@ -1,0 +1,388 @@
+---
+title: "Remove Stimulation Artifacts"
+output:
+  html_document: default
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+# This code block sets up the engine environment
+# Please do not remove me
+ravepipeline::pipeline_setup_rmd("stim_artifact_removal")
+```
+
+## From the loading screen
+
+```{rave load_subject, export = "subject"}
+subject <- ravecore::new_rave_subject(
+  project_name = project_name,
+  subject_code = subject_code
+)
+```
+
+
+## Workflow
+
+
+
+
+## Obsolete AI-generated non-sense
+
+The pipeline ports the MATLAB stimulation-artifact-removal prototype
+(`tmp/artifact_rej.m`) into RAVE targets. Detection and alignment reuse
+`ravetools::stimpulse_find` / `ravetools::stimpulse_align`; the distinctive
+template-subtraction + moving-average gap-fill cleaning lives in
+`R/shared-signal_processing.R`. Every compute target loops over
+`subject$blocks` and returns a named list keyed by block.
+
+```{rave clean_loaded_electrodes, export = "loaded_electrodes_cleaned"}
+loaded_electrodes <- ravecore:::parse_svec(loaded_electrodes)
+if (!length(loaded_electrodes) %in% c(1, 2)) {
+  stop("Only two electrode channels are allowed. Please enter one channel, or two channels (for bipolar re-reference)")
+}
+
+electrode_types <- subject$electrode_types[subject$electrodes %in% loaded_electrodes]
+electrode_types <- unique(electrode_types)
+if (length(electrode_types) != 1) {
+  stop("Electrode channels must have the same signal type (e.g. both are LFP, or Aux, but not either).")
+}
+loaded_electrodes_cleaned <- sort(loaded_electrodes)
+```
+
+```{rave load_repository, export = "repository"}
+# One repository loads the recording channels AND (when used) the trigger/sync
+# channel together. The trigger is only added when detection is not forced to
+# 'epoch' and a valid, distinct trigger electrode is provided.
+elecs <- loaded_electrodes_cleaned
+te <- tryCatch(as.integer(ravecore:::parse_svec(trigger_electrode)),
+               error = function(e) integer(0))
+use_trigger <- !identical(detection_source, "epoch") &&
+  length(te) == 1 && te %in% subject$electrodes &&
+  !te %in% loaded_electrodes_cleaned
+if (use_trigger) {
+  elecs <- sort(unique(c(loaded_electrodes_cleaned, te)))
+}
+
+repository <- ravecore::prepare_subject_raw_voltage_with_blocks(
+  subject = subject,
+  electrodes = elecs,
+  downsample = NA
+)
+```
+
+```{rave preload_stim_epoch, export = "preloaded_stim_epoch"}
+if (isTRUE(epoch_name %in% subject$epoch_names)) {
+  preloaded_stim_epoch <- subject$get_epoch(epoch_name)
+} else {
+  preloaded_stim_epoch <- NULL
+}
+```
+
+```{rave load_signals, export = "loaded_signals"}
+filearray_root <- file.path(pipeline$pipeline_path, "data", "raw-voltage")
+if (!dir.exists(filearray_root)) {
+  dir.create(filearray_root, showWarnings = FALSE, recursive = TRUE)
+}
+
+container <- repository$get_container()
+rec_elecs <- loaded_electrodes_cleaned
+
+loaded_signals <- lapply(subject$blocks, function(block) {
+  fbase <- file.path(filearray_root, block)
+
+  extracted <- extract_block_signal(container[[block]], rec_elecs)
+  signals <- extracted$data
+  sample_rate <- extracted$sample_rate
+  time <- extracted$time
+
+  if (file.exists(fbase)) {
+    unlink(fbase, recursive = TRUE)
+  }
+  farr <- filearray::filearray_create(
+    filebase = fbase,
+    dimension = c(nrow(signals), 1L),
+    type = "float",
+    partition_size = 1L,
+    initialize = FALSE
+  )
+
+  farr$set_header(key = "subject_id", value = repository$subject$subject_id, save = FALSE)
+  farr$set_header(key = "block", value = block, save = FALSE)
+  farr$set_header(key = "sample_rate", value = sample_rate, save = FALSE)
+  farr$set_header(key = "max_duration", value = max(time), save = FALSE)
+
+  # set epoch
+  if (!is.null(preloaded_stim_epoch)) {
+    epoch_table <- preloaded_stim_epoch$table
+    if (is.data.frame(epoch_table) && nrow(epoch_table)) {
+      block_epoch_table <- epoch_table[as.character(epoch_table$Block) == as.character(block), ]
+      if (nrow(block_epoch_table)) {
+        farr$set_header("epoch_table", block_epoch_table, save = FALSE)
+      }
+    }
+  }
+
+  if (length(rec_elecs) == 1) {
+    farr[] <- signals[, 1]
+    dimnames(farr) <- list(
+      Time = time,
+      Electrode = rec_elecs
+    )
+  } else {
+    # bipolar = ch1 - ch2 (MATLAB convention)
+    farr[] <- signals[, 1] - signals[, 2]
+    dimnames(farr) <- list(
+      Time = time,
+      Electrode = sprintf("%s-%s", rec_elecs[[1]], rec_elecs[[2]])
+    )
+  }
+
+  ravepipeline::RAVEFileArray$new(x = farr, temporary = FALSE)
+})
+names(loaded_signals) <- subject$blocks
+```
+
+```{rave load_trigger_signals, export = "trigger_signals"}
+# Read the trigger/sync channel from the SAME repository container (no second
+# repository). Populated only when a valid, distinct trigger electrode is used.
+trigger_signals <- NULL
+te <- tryCatch(as.integer(ravecore:::parse_svec(trigger_electrode)),
+               error = function(e) integer(0))
+use_trigger <- !identical(detection_source, "epoch") &&
+  length(te) == 1 && te %in% repository$electrode_list &&
+  !te %in% loaded_electrodes_cleaned
+
+if (use_trigger) {
+  trigger_root <- file.path(pipeline$pipeline_path, "data", "trigger-voltage")
+  if (!dir.exists(trigger_root)) {
+    dir.create(trigger_root, showWarnings = FALSE, recursive = TRUE)
+  }
+  container <- repository$get_container()
+
+  trigger_signals <- lapply(subject$blocks, function(block) {
+    extracted <- extract_block_signal(container[[block]], te)
+    sig <- as.numeric(extracted$data[, 1])
+
+    fbase <- file.path(trigger_root, block)
+    if (file.exists(fbase)) { unlink(fbase, recursive = TRUE) }
+    farr <- filearray::filearray_create(
+      filebase = fbase, dimension = c(length(sig), 1L),
+      type = "float", partition_size = 1L, initialize = FALSE)
+    farr[] <- sig
+    farr$set_header("block", block, save = FALSE)
+    farr$set_header("sample_rate", extracted$sample_rate, save = FALSE)
+    ravepipeline::RAVEFileArray$new(x = farr, temporary = FALSE)
+  })
+  names(trigger_signals) <- subject$blocks
+}
+```
+
+```{rave detect_pulses, export = "pulse_info_list"}
+pulse_duration_sec <- pulse_duration / 1000
+
+# Resolve detection mode. 'auto' uses the trigger channel when available,
+# otherwise the preloaded stim epoch. Neither uses ravetools.
+trigger_available <- is.list(trigger_signals) && length(trigger_signals) > 0
+detection_mode <- if (identical(detection_source, "trigger")) {
+  "trigger"
+} else if (identical(detection_source, "epoch")) {
+  "epoch"
+} else if (trigger_available) {
+  "trigger"
+} else {
+  "epoch"
+}
+
+pulse_info_list <- structure(
+  names = subject$blocks,
+  lapply(subject$blocks, function(block) {
+    arr <- loaded_signals[[block]]$`@impl`
+    sample_rate <- arr$get_header("sample_rate")
+
+    if (identical(detection_mode, "trigger") && trigger_available) {
+      trig <- trigger_signals[[block]]$`@impl`[drop = TRUE, dimnames = FALSE]
+      detect_pulses_from_trigger(
+        trigger = trig, sample_rate = sample_rate,
+        threshold = as.numeric(trigger_threshold),
+        stim_frequency = stim_frequency, stim_length = stim_length,
+        pulse_duration_sec = pulse_duration_sec)
+    } else {
+      epoch_table <- if (!is.null(preloaded_stim_epoch)) preloaded_stim_epoch$table else NULL
+      detect_pulses_from_epoch(
+        epoch_table = epoch_table, block = block,
+        sample_rate = sample_rate, pulse_duration_sec = pulse_duration_sec)
+    }
+  })
+)
+```
+
+```{rave align_pulses, export = "aligned_pulse_list"}
+# Faithful MATLAB alignment: local min/max within rows search_start:search_end.
+search_start <- as.integer(align_search_start)
+search_end <- as.integer(align_search_end)
+
+aligned_pulse_list <- structure(
+  names = subject$blocks,
+  lapply(subject$blocks, function(block) {
+    info <- pulse_info_list[[block]]
+    if (!isTRUE(info$n_pulses > 0)) { return(info) }
+
+    arr <- loaded_signals[[block]]$`@impl`
+    sample_rate <- arr$get_header("sample_rate")
+    signal <- arr[drop = TRUE, dimnames = FALSE]
+
+    win <- suppressWarnings(as.integer(snip_window))
+    if (!length(win) || !isTRUE(win >= 2)) {
+      win <- round(sample_rate / stim_frequency)
+    }
+    pulse_dur_samples <- round((pulse_duration / 1000) * sample_rate)
+
+    align_pulses_minmax(
+      signal, onset_index = info$onset_index, snip_window = win,
+      search_start = search_start, search_end = search_end,
+      pulse_duration_samples = pulse_dur_samples)
+  })
+)
+```
+
+```{rave build_snippets, export = "snippet_list"}
+snippet_list <- structure(
+  names = subject$blocks,
+  lapply(subject$blocks, function(block) {
+    info <- aligned_pulse_list[[block]]
+    if (!isTRUE(info$n_pulses > 0)) { return(NULL) }
+
+    arr <- loaded_signals[[block]]$`@impl`
+    sample_rate <- arr$get_header("sample_rate")
+    signal <- arr[drop = TRUE, dimnames = FALSE]
+
+    win <- suppressWarnings(as.integer(snip_window))
+    if (!length(win) || !isTRUE(win >= 2)) {
+      win <- round(sample_rate / stim_frequency)
+    }
+    pre <- abs(as.integer(template_window_pre))
+
+    snips <- extract_snippets(
+      signal, onset_index = info$onset_index,
+      snip_window = win, pre = pre)
+
+    list(
+      snips = snips,
+      onset_index = info$onset_index,
+      pre = pre,
+      snip_window = win,
+      sample_rate = sample_rate
+    )
+  })
+)
+```
+
+```{rave compute_template, export = "template_list"}
+template_list <- structure(
+  names = subject$blocks,
+  lapply(subject$blocks, function(block) {
+    snip <- snippet_list[[block]]
+    if (is.null(snip)) { return(NULL) }
+
+    tmpl <- compute_stim_template(snip$snips, blank_width = artifact_blank_width)
+
+    pca <- NULL
+    if (isTRUE(pca_enabled)) {
+      pca <- snippet_pca(
+        snip$snips, valid_rows = tmpl$valid_rows,
+        n_components = pca_n_components)
+    }
+
+    list(
+      template = tmpl,
+      pca = pca,
+      sample_rate = snip$sample_rate,
+      pre = snip$pre
+    )
+  })
+)
+```
+
+```{rave clean_signals, export = "cleaned_signals"}
+filearray_root <- file.path(pipeline$pipeline_path, "data", "cleaned-voltage")
+if (!dir.exists(filearray_root)) {
+  dir.create(filearray_root, showWarnings = FALSE, recursive = TRUE)
+}
+
+cleaned_signals <- structure(
+  names = subject$blocks,
+  lapply(subject$blocks, function(block) {
+    arr <- loaded_signals[[block]]$`@impl`
+    sample_rate <- arr$get_header("sample_rate")
+    signal <- arr[drop = TRUE, dimnames = FALSE]
+
+    info <- aligned_pulse_list[[block]]
+    snip <- snippet_list[[block]]
+    tmpl <- template_list[[block]]
+
+    cleaned <- as.numeric(signal)
+    n_pulses <- 0L
+    if (!is.null(snip) && !is.null(tmpl) && isTRUE(info$n_pulses > 0)) {
+      n_pulses <- info$n_pulses
+      cleaned <- subtract_template_and_fill(
+        signal = signal,
+        snips = snip$snips,
+        onset_index = snip$onset_index,
+        pre = snip$pre,
+        template = tmpl$template,
+        gap_fill_window = as.integer(gap_fill_window))
+    }
+
+    fbase <- file.path(filearray_root, block)
+    if (file.exists(fbase)) { unlink(fbase, recursive = TRUE) }
+    farr <- filearray::filearray_create(
+      filebase = fbase,
+      dimension = c(length(cleaned), 1L),
+      type = "float",
+      partition_size = 1L,
+      initialize = FALSE)
+    farr[] <- cleaned
+    dimnames(farr) <- dimnames(arr)
+
+    farr$set_header("subject_id", arr$get_header("subject_id"), save = FALSE)
+    farr$set_header("block", block, save = FALSE)
+    farr$set_header("sample_rate", sample_rate, save = FALSE)
+    farr$set_header("max_duration", arr$get_header("max_duration"), save = FALSE)
+    farr$set_header("n_pulses", n_pulses, save = FALSE)
+    farr$set_header("cleaning_method", "template_subtraction", save = FALSE)
+
+    ravepipeline::RAVEFileArray$new(x = farr, temporary = FALSE)
+  })
+)
+```
+
+The following plain `r` block reproduces the MATLAB "original vs cleaned"
+comparison during interactive knitting. It is **not** a pipeline target.
+
+```{r before_after, echo=FALSE}
+block <- subject$blocks[[1]]
+raw <- loaded_signals[[block]]$`@impl`[drop = TRUE, dimnames = FALSE]
+cln <- cleaned_signals[[block]]$`@impl`[drop = TRUE, dimnames = FALSE]
+sr <- cleaned_signals[[block]]$`@impl`$get_header("sample_rate")
+plot_before_after(raw, cln, sample_rate = sr, time_range = c(NA, NA))
+```
+
+## Build, Visualize, & Run
+
+Please make sure the following code block is at the end of your pipeline file.
+This block will build the pipeline and generate a
+`make-stim_artifact_removal.R` script.
+
+```{r build, echo=FALSE, results='hide'}
+build_pipeline(make_file = "make-stim_artifact_removal.R")
+```
+
+```{r visualize, echo=FALSE}
+# Fixed usage, show pipeline graph
+try({
+  ravepipeline:::pipeline_dependency_graph(
+    pipeline_path = ".", glimpse = TRUE)
+}, silent = TRUE)
+```

@@ -65,6 +65,10 @@ modules:
     label: Find Stimulation Pulses
     group: Epoch Processing
     order: 3.2
+  stim_artifact_removal:
+    label: Stim Artifact Removal
+    group: Epoch Processing
+    order: 3.3
   yael_preprocess:
     label: MRI/CT Preprocessing
     group: Images & Electrodes

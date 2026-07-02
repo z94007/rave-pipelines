@@ -1,0 +1,613 @@
+---
+title: "Remove Stimulation Artifacts"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include = FALSE}
+# This code block sets up the engine environment
+# Please do not remove me
+ravepipeline::pipeline_setup_rmd("stim_artifact_removal")
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 10)
+```
+
+# Overview
+
+Electrical stimulation delivered through an intracranial electrode injects a large,
+stereotyped voltage transient into every recording channel. Each pulse produces two
+things we want to remove:
+
+1. a **direct artifact** — the electrode network saturates for a fraction of a
+   millisecond around the pulse; and
+2. a **secondary artifact** — the tissue/amplifier "rebounds" in the tens-of-
+   milliseconds *after* each pulse, riding on top of the brain signal we care about.
+
+This pipeline is a mathematically faithful R port of the MATLAB prototype
+`tmp/artifact_rej.m`, wrapped in the standard RAVE "load many, analyze one" workflow.
+The cleaning strategy has two stages, applied in order:
+
+* **Bipolar re-reference** (within a shaft, skipping the stim contact) cancels the
+  shared secondary artifact and common-mode noise for channels away from the stim site.
+* **Template subtraction** removes the residual, near-site secondary artifact that
+  survives bipolar re-referencing, by estimating the stereotyped per-pulse waveform and
+  subtracting it pulse-by-pulse, then interpolating across the blanked direct-artifact
+  region.
+
+Pulse timing is recovered by thresholding the **stim electrode itself**: it carries the
+cleanest square pulses and therefore the most reliable per-pulse timestamps. Because the
+stim electrode can differ block-to-block, the pipeline analyzes **one block at a time**
+(`analysis_block` + its `stim_electrode`); to process another block, change those two
+settings and re-run.
+
+The workflow is organized in four sections, mirroring the MATLAB script section-by-section.
+
+# Section 1 — Load raw voltage
+
+Artifact removal must operate on **raw** voltage: not referenced, not notch-filtered, not
+epoched. The artifact lives in the raw trace, and any prior referencing would already have
+mixed it across channels. We load a user-chosen subset of contacts (`loaded_electrodes`,
+blank = all LFP channels) across the requested blocks (`loaded_blocks`, blank = all), using
+`prepare_subject_raw_voltage_with_blocks`, which pages whole-block voltage from SSD via
+`filearray`. The stim electrode is fetched on demand by `load_stim_channel()`, which reads
+it from the repository when already loaded, or transparently loads it otherwise.
+
+```{rave load_subject, language = "R", export = "subject"}
+subject <- ravecore::new_rave_subject(
+  project_name = project_name,
+  subject_code = subject_code,
+  strict = FALSE
+)
+```
+
+```{rave clean_loaded_electrodes, language = "R", export = "loaded_electrode_clean"}
+loaded_electrode_clean <- dipsaus::parse_svec(loaded_electrodes)
+if (!length(loaded_electrode_clean)) {
+  # blank -> all LFP channels
+  loaded_electrode_clean <- subject$electrodes[subject$electrode_types == "LFP"]
+}
+loaded_electrode_clean <- sort(unique(as.integer(
+  loaded_electrode_clean[loaded_electrode_clean %in% subject$electrodes]
+)))
+if (!length(loaded_electrode_clean)) {
+  stop("No valid electrodes to load for this subject.")
+}
+```
+
+```{rave clean_analysis_electrodes, language = "R", export = "analysis_electrode_clean"}
+stim_e <- dipsaus::parse_svec(stim_electrode)
+requested <- dipsaus::parse_svec(analysis_electrodes)
+if (!length(requested)) {
+  # blank -> all loaded LFP contacts except the stim electrode(s)
+  requested <- setdiff(loaded_electrode_clean, stim_e)
+}
+lfp <- subject$electrodes[subject$electrode_types == "LFP"]
+analysis_electrode_clean <- sort(unique(as.integer(
+  requested[requested %in% loaded_electrode_clean & requested %in% lfp]
+)))
+```
+
+```{rave clean_blocks, language = "R", export = "loaded_block_clean"}
+loaded_block_clean <- loaded_blocks
+if (!length(loaded_block_clean) ||
+    (length(loaded_block_clean) == 1 && is.na(loaded_block_clean[[1]]))) {
+  loaded_block_clean <- subject$blocks
+}
+loaded_block_clean <- intersect(as.character(unlist(loaded_block_clean)), subject$blocks)
+if (!length(loaded_block_clean)) {
+  loaded_block_clean <- subject$blocks
+}
+if (!isTRUE(as.character(analysis_block) %in% loaded_block_clean)) {
+  stop(sprintf("analysis_block '%s' is not among the loaded blocks: %s",
+               analysis_block, paste(loaded_block_clean, collapse = ", ")))
+}
+```
+
+```{rave load_repository, language = "R", export = "repository"}
+repository <- ravecore::prepare_subject_raw_voltage_with_blocks(
+  subject = subject,
+  electrodes = loaded_electrode_clean,
+  blocks = loaded_block_clean,
+  downsample = NA
+)
+```
+
+```{rave load_signals, language = "R", export = "loaded_signals"}
+# Materialize each loaded block as a (Time x Electrode) filearray handle.
+filearray_root <- file.path(pipeline$pipeline_path, "data", "raw-voltage")
+container <- repository$get_container()
+
+loaded_signals <- structure(
+  names = loaded_block_clean,
+  lapply(loaded_block_clean, function(block) {
+    ex <- extract_block_signal(container[[block]], loaded_electrode_clean)
+    new_rave_filearray(
+      filebase = file.path(filearray_root, block),
+      data = ex$data,
+      dimnames_list = list(Time = ex$time, Electrode = loaded_electrode_clean),
+      headers = list(
+        subject_id = repository$subject$subject_id,
+        block = block,
+        sample_rate = ex$sample_rate,
+        max_duration = max(ex$time)
+      )
+    )
+  })
+)
+```
+
+The stim electrode carries near-square pulses; here is its raw trace for the block being
+analyzed. This is the signal we threshold to recover pulse timing (MATLAB `plot(sync)`).
+
+```{r diag_stim_trace, echo=FALSE, fig.height=3.5}
+try({
+  stim <- load_stim_channel(repository, stim_electrode, block = analysis_block)
+  plot_stim_trace_with_onsets(
+    trace = stim$data, sample_rate = stim$sample_rate,
+    threshold = as.numeric(stim_threshold),
+    time_range = c(0, min(5, max(stim$time))),
+    main = sprintf("Stim electrode %s - block %s (first 5 s)",
+                   stim_electrode, analysis_block)
+  )
+})
+```
+
+# Section 2 — Pulse detection
+
+We recover per-pulse timing by thresholding the stim electrode. Unlike a dedicated sync /
+"Events" channel (which stays high for a whole train, as in the MATLAB prototype), the
+stim electrode fires one saturating square pulse at a time and **rails in both directions**
+(±full-scale), so each biphasic pulse crosses the threshold several times. We therefore
+threshold the **absolute value** (`stim_threshold`) and coalesce crossings with a
+**refractory period**: an onset is kept only if it is at least 0.8 of one inter-pulse
+interval after the previous kept onset. This collapses the multiple within-pulse crossings
+into a single, reliable timestamp per pulse, while genuine pulse-to-pulse gaps (≈
+`sample_rate / stim_frequency` samples at `stim_frequency`) are preserved. These onsets,
+shared across all channels of this block, index the snippets used downstream. The per-pulse
+window is `snip_window = round(sample_rate / stim_frequency)` (one inter-pulse interval).
+
+```{rave detect_pulses, language = "R", export = "pulse_info"}
+stim <- load_stim_channel(repository, stim_electrode, block = analysis_block)
+sample_rate <- stim$sample_rate
+
+info <- detect_pulses_from_stim_channel(
+  signal = stim$data,
+  sample_rate = sample_rate,
+  threshold = as.numeric(stim_threshold),
+  stim_frequency = as.numeric(stim_frequency),
+  refractory_frac = 0.8,
+  pulse_duration_sec = as.numeric(pulse_duration) / 1000
+)
+info$sample_rate <- sample_rate
+info$block <- as.character(analysis_block)
+info$stim_electrode <- stim_electrode
+pulse_info <- info
+```
+
+The detected onsets (red) on the stim trace, zoomed to the first train, and the raw
+per-pulse snippets cut at those onsets (MATLAB `plot(snips)`) - before alignment they are
+jittered by up to a few samples.
+
+```{r diag_detection, echo=FALSE, fig.height=3.5}
+try({
+  stim <- load_stim_channel(repository, stim_electrode, block = analysis_block)
+  sr <- stim$sample_rate
+  if (isTRUE(pulse_info$n_pulses > 0)) {
+    first_on <- pulse_info$onset_index[[1]]
+    plot_stim_trace_with_onsets(
+      trace = stim$data, sample_rate = sr, onsets = pulse_info$onset_index,
+      threshold = as.numeric(stim_threshold),
+      time_range = c(max(0, (first_on / sr) - 0.05), (first_on / sr) + 0.6),
+      main = sprintf("Detected onsets - %d pulses in block %s",
+                     pulse_info$n_pulses, analysis_block)
+    )
+  } else {
+    plot.new(); text(0.5, 0.5, "No pulses detected (check stim_threshold / stim_electrode)")
+  }
+})
+```
+
+```{r diag_raw_snippets, echo=FALSE, fig.height=3.5}
+try({
+  stim <- load_stim_channel(repository, stim_electrode, block = analysis_block)
+  sr <- stim$sample_rate
+  if (isTRUE(pulse_info$n_pulses > 0)) {
+    win <- suppressWarnings(as.integer(snip_window))
+    if (!length(win) || is.na(win) || win < 2L) win <- round(sr / as.numeric(stim_frequency))
+    raw_snips <- extract_snippets(stim$data, pulse_info$onset_index, snip_window = win, pre = 0)
+    plot_pulse_snippets_overlay(
+      raw_snips, sample_rate = sr, pre = 0,
+      main = sprintf("Raw pulse snippets on stim electrode (n = %d, pre-alignment)",
+                     ncol(raw_snips))
+    )
+  }
+})
+```
+
+# Section 3 — Bipolar re-reference
+
+A bipolar derivation subtracts two nearby contacts (`anode - cathode`). Because the
+secondary artifact and common-mode noise are shared by neighbouring contacts, the
+subtraction cancels most of it - while a genuine local brain signal, which differs between
+contacts, survives. Two rules keep the derivation physically meaningful:
+
+* **Stay within a shaft.** Contacts on different probes are not physically adjacent, so we
+  never pair across shafts. The shaft is the electrode's surgical label with trailing
+  digits removed (`LabelPrefix`, else `gsub("[0-9]+$","",Label)`).
+* **Skip the stim contact.** The stim electrode is saturated and useless as a reference, so
+  we remove it and pair its neighbours across the gap (e.g. stim 38 => bipolar **37-39**).
+
+Channels far from the stim site are usually clean after this step. Near-site channels often
+retain a residual secondary artifact, visible as sharp peaks at the stim frequency and its
+harmonics in the Welch periodogram - those are the channels that need Section 4.
+
+```{rave build_bipolar_pairs, language = "R", export = "bipolar_pairs"}
+electrode_table <- subject$get_electrode_table()
+stim_e <- dipsaus::parse_svec(stim_electrode)
+
+bipolar_pairs <- build_bipolar_pairs(
+  electrode_table = electrode_table,
+  analysis_electrodes = analysis_electrode_clean,
+  stim_electrodes = stim_e,
+  available_electrodes = loaded_electrode_clean
+)
+```
+
+```{rave apply_bipolar, language = "R", export = "bipolar_signals"}
+block <- as.character(analysis_block)
+arr <- loaded_signals[[block]]$`@impl`
+sample_rate <- arr$get_header("sample_rate")
+signals <- arr[, , drop = FALSE, dimnames = FALSE]      # Time x Electrode
+time <- as.numeric(dimnames(arr)$Time)
+
+bip <- apply_bipolar_pairs(signals, loaded_electrode_clean, bipolar_pairs)
+
+filearray_root <- file.path(pipeline$pipeline_path, "data", "bipolar-voltage")
+if (ncol(bip) > 0) {
+  bipolar_signals <- new_rave_filearray(
+    filebase = file.path(filearray_root, block),
+    data = bip,
+    dimnames_list = list(Time = time, Electrode = colnames(bip)),
+    headers = list(block = block, sample_rate = sample_rate)
+  )
+} else {
+  bipolar_signals <- NULL
+}
+```
+
+Monopolar vs bipolar Welch periodogram for a near-stim channel. The stim-frequency comb
+(dashed grey) should shrink after bipolar re-referencing.
+
+```{r diag_pwelch_bipolar, echo=FALSE, fig.height=4}
+try({
+  block <- as.character(analysis_block)
+  if (!is.null(bipolar_signals) && nrow(bipolar_pairs) > 0) {
+    barr <- bipolar_signals$`@impl`
+    sr <- barr$get_header("sample_rate")
+    labs <- dimnames(barr)$Electrode
+    # prefer a bridged (across-stim) pair - the closest to the stim site
+    idx <- which(bipolar_pairs$bridged)
+    disp <- if (length(idx)) bipolar_pairs$label[[idx[[1]]]] else labs[[1]]
+    disp_i <- match(disp, labs)
+    if (is.na(disp_i)) disp_i <- 1L
+    bipolar_trace <- barr[, disp_i, drop = TRUE, dimnames = FALSE]
+
+    # monopolar anode of the same pair
+    anode <- bipolar_pairs$anode[match(labs[[disp_i]], bipolar_pairs$label)]
+    marr <- loaded_signals[[block]]$`@impl`
+    mono_i <- match(anode, loaded_electrode_clean)
+    mono_trace <- marr[, mono_i, drop = TRUE, dimnames = FALSE]
+
+    harmonics <- as.numeric(stim_frequency) * seq_len(10)
+    plot_pwelch_compare(
+      traces = stats::setNames(
+        list(mono_trace, bipolar_trace),
+        c(sprintf("monopolar %s", anode), sprintf("bipolar %s", labs[[disp_i]]))),
+      sample_rate = sr, win_sec = 1, max_freq = 500, marks = harmonics,
+      main = "Monopolar vs bipolar periodogram (near-stim channel)"
+    )
+  } else {
+    plot.new(); text(0.5, 0.5, "No within-shaft bipolar pairs for this selection")
+  }
+})
+```
+
+# Section 4 — Template subtraction
+
+For near-site channels where bipolar re-referencing leaves a residual, we remove the
+stereotyped secondary artifact directly (MATLAB L73-199). For each bipolar channel:
+
+1. **Snip & align.** Cut one inter-pulse window per pulse at the detected onsets, then
+   align them by their dominant local extremum in rows `align_search_start:align_search_end`
+   (the polarity - trough or crest - is chosen by whichever has the larger mean magnitude),
+   shifting each onset by `ix - ix[1]` so the pulses superimpose.
+2. **Blank.** Set the first `artifact_blank_width` samples (the saturated direct artifact)
+   and the final seam sample to `NA`; these are excluded from the template and interpolated
+   later.
+3. **Profile / cluster.** Run PCA on the pulses and (optionally) cluster them with
+   `profile_pulses(k = n_clusters)`. With `n_clusters = 1` this is the single global
+   template of the MATLAB script; `k > 1` captures distinct artifact shapes (e.g. drift or
+   state changes) with one template each. The function is method-pluggable so alternative
+   clusterers can be dropped in later.
+4. **Template.** Each cluster's template is the demeaned (`detrend(..., 0)`) average of its
+   pulses over the non-blanked rows.
+5. **Subtract, back-fill, gap-fill.** Subtract each pulse's cluster template on the valid
+   rows, write the corrected snippets back into the continuous trace (leaving the blanked
+   region as `NA`), then fill those gaps with a centered moving average
+   (`gap_fill_window`) followed by nearest-value for any edge residue.
+
+```{rave build_snippets, language = "R", export = "snippet_list"}
+block <- as.character(analysis_block)
+sample_rate <- pulse_info$sample_rate
+pre <- abs(as.integer(template_window_pre))
+win <- suppressWarnings(as.integer(snip_window))
+if (!length(win) || is.na(win) || win < 2L) win <- round(sample_rate / as.numeric(stim_frequency))
+
+snippet_list <- list()
+if (!is.null(bipolar_signals) && isTRUE(pulse_info$n_pulses > 0)) {
+  barr <- bipolar_signals$`@impl`
+  labs <- dimnames(barr)$Electrode
+  snippet_list <- structure(
+    names = labs,
+    lapply(seq_along(labs), function(j) {
+      trace <- barr[, j, drop = TRUE, dimnames = FALSE]
+      list(
+        snips = extract_snippets(trace, pulse_info$onset_index, snip_window = win, pre = pre),
+        onset_index = pulse_info$onset_index,
+        pre = pre, snip_window = win, sample_rate = sample_rate
+      )
+    })
+  )
+}
+```
+
+```{rave align_pulses, language = "R", export = "aligned_pulse_list"}
+search_start <- as.integer(align_search_start)
+search_end <- as.integer(align_search_end)
+pulse_dur_samples <- round((as.numeric(pulse_duration) / 1000) * pulse_info$sample_rate)
+
+aligned_pulse_list <- list()
+if (length(snippet_list) && !is.null(bipolar_signals)) {
+  barr <- bipolar_signals$`@impl`
+  labs <- names(snippet_list)
+  aligned_pulse_list <- structure(
+    names = labs,
+    lapply(seq_along(labs), function(j) {
+      snip <- snippet_list[[j]]
+      trace <- barr[, j, drop = TRUE, dimnames = FALSE]
+
+      al <- align_pulses_minmax(
+        signal = trace, onset_index = snip$onset_index, snip_window = snip$snip_window,
+        search_start = search_start, search_end = search_end,
+        pulse_duration_samples = pulse_dur_samples
+      )
+      snips <- extract_snippets(trace, al$onset_index, snip_window = snip$snip_window, pre = snip$pre)
+      list(
+        snips = snips, onset_index = al$onset_index, n_pulses = al$n_pulses,
+        pre = snip$pre, snip_window = snip$snip_window, sample_rate = snip$sample_rate
+      )
+    })
+  )
+}
+```
+
+```{rave compute_template, language = "R", export = "template_list"}
+k <- max(1L, as.integer(n_clusters))
+blank_width <- as.integer(artifact_blank_width)
+ncomp <- max(1L, as.integer(pca_n_components))
+
+template_list <- list()
+if (length(aligned_pulse_list)) {
+  labs <- names(aligned_pulse_list)
+  template_list <- structure(
+    names = labs,
+    lapply(seq_along(labs), function(j) {
+      al <- aligned_pulse_list[[j]]
+      if (!isTRUE(ncol(al$snips) > 0)) return(NULL)
+
+      n_rows <- nrow(al$snips)
+      valid_rows <- setdiff(seq_len(n_rows), unique(c(seq_len(blank_width), n_rows)))
+
+      profile <- profile_pulses(
+        al$snips, k = k, method = "pca_kmeans",
+        n_components = ncomp, valid_rows = valid_rows
+      )
+      ctempl <- compute_cluster_templates(al$snips, profile$cluster, blank_width = blank_width)
+      template_full <- vapply(ctempl$templates, function(t) t$template_full, numeric(n_rows))
+
+      list(
+        profile = profile,
+        cluster_templates = ctempl,
+        template_full = matrix(template_full, nrow = n_rows,
+                               dimnames = list(NULL, names(ctempl$templates))),
+        blank_rows = ctempl$blank_rows,
+        sample_rate = al$sample_rate, pre = al$pre
+      )
+    })
+  )
+}
+```
+
+```{rave clean_signals, language = "R", export = "cleaned_signals"}
+block <- as.character(analysis_block)
+gap_win <- as.integer(gap_fill_window)
+filearray_root <- file.path(pipeline$pipeline_path, "data", "cleaned-voltage")
+
+cleaned_signals <- list()
+if (length(template_list) && !is.null(bipolar_signals)) {
+  barr <- bipolar_signals$`@impl`
+  labs <- names(template_list)
+  time <- as.numeric(dimnames(barr)$Time)
+
+  cleaned_signals <- structure(
+    names = labs,
+    lapply(seq_along(labs), function(j) {
+      tmpl <- template_list[[j]]
+      al <- aligned_pulse_list[[j]]
+      trace <- barr[, j, drop = TRUE, dimnames = FALSE]
+      if (is.null(tmpl) || !isTRUE(al$n_pulses > 0)) {
+        cleaned <- as.numeric(trace)
+      } else {
+        cleaned <- subtract_cluster_templates_and_fill(
+          signal = trace, snips = al$snips, onset_index = al$onset_index,
+          pre = al$pre, cluster_templates = tmpl$cluster_templates,
+          gap_fill_window = gap_win
+        )
+      }
+      new_rave_filearray(
+        filebase = file.path(filearray_root, sprintf("%s_%s", block, labs[[j]])),
+        data = matrix(cleaned, ncol = 1L),
+        dimnames_list = list(Time = time, Electrode = labs[[j]]),
+        headers = list(
+          block = block, channel = labs[[j]],
+          sample_rate = barr$get_header("sample_rate"),
+          n_pulses = al$n_pulses, cleaning_method = "template_subtraction"
+        )
+      )
+    })
+  )
+}
+```
+
+## Diagnostic figures
+
+The following figures are drawn for the near-stim display channel (the bridged pair when
+available). They reproduce, in order, the key MATLAB visualizations.
+
+```{r diag_display_channel, echo=FALSE}
+.disp <- NULL
+try({
+  if (length(template_list)) {
+    labs <- names(template_list)
+    idx <- which(bipolar_pairs$bridged & bipolar_pairs$label %in% labs)
+    .disp <- if (length(idx)) bipolar_pairs$label[[idx[[1]]]] else labs[[1]]
+  }
+})
+```
+
+**Aligned pulses with the estimated template(s).** Grey/colored = individual aligned
+pulses; heavy lines = the per-cluster templates (MATLAB `plot(snips2)` + template).
+
+```{r diag_aligned_snippets, echo=FALSE, fig.height=3.8}
+try({
+  if (!is.null(.disp)) {
+    al <- aligned_pulse_list[[.disp]]; tmpl <- template_list[[.disp]]
+    plot_pulse_snippets_overlay(
+      al$snips, sample_rate = al$sample_rate, pre = al$pre,
+      template_full = tmpl$template_full, cluster = tmpl$profile$cluster,
+      main = sprintf("Aligned pulses - channel %s (n = %d)", .disp, ncol(al$snips))
+    )
+  }
+})
+```
+
+**Pulse PCA scores, colored by cluster** (MATLAB `scatter(Y2)`). Clear separation suggests
+more than one artifact shape and motivates `n_clusters > 1`.
+
+```{r diag_pca, echo=FALSE, fig.height=3.8}
+try({
+  if (!is.null(.disp)) {
+    tmpl <- template_list[[.disp]]
+    plot_pca_scatter(tmpl$profile, cluster = tmpl$profile$cluster)
+  }
+})
+```
+
+**Estimated template(s)** with the blanked direct-artifact region shaded (MATLAB
+`plot(temp1)`).
+
+```{r diag_template, echo=FALSE, fig.height=3.5}
+try({
+  if (!is.null(.disp)) {
+    tmpl <- template_list[[.disp]]
+    plot_template_waveform(
+      tmpl$template_full, sample_rate = tmpl$sample_rate,
+      blank_width = length(tmpl$blank_rows), pre = tmpl$pre
+    )
+  }
+})
+```
+
+**Template-subtracted pulses** - the residual after removing each pulse's cluster template,
+with the blanked artifact region left as `NA` (MATLAB `plot(psnips_sub)`).
+
+```{r diag_subtracted, echo=FALSE, fig.height=3.5}
+try({
+  if (!is.null(.disp)) {
+    al <- aligned_pulse_list[[.disp]]; tmpl <- template_list[[.disp]]
+    ct <- tmpl$cluster_templates
+    sub <- al$snips
+    for (i in seq_len(ncol(sub))) {
+      t_i <- ct$templates[[paste0("cluster", ct$cluster[[i]])]]
+      sub[t_i$valid_rows, i] <- sub[t_i$valid_rows, i] - t_i$template_valid
+      sub[t_i$blank_rows, i] <- NA_real_
+    }
+    plot_pulse_snippets_overlay(
+      sub, sample_rate = al$sample_rate, pre = al$pre,
+      template_full = rowMeans(sub, na.rm = TRUE),
+      main = sprintf("Template-subtracted pulses - channel %s", .disp)
+    )
+  }
+})
+```
+
+**Before vs after** on the continuous bipolar trace (MATLAB "Original vs cleaned").
+
+```{r diag_before_after, echo=FALSE, fig.height=3.8}
+try({
+  if (!is.null(.disp)) {
+    barr <- bipolar_signals$`@impl`
+    labs <- dimnames(barr)$Electrode
+    raw <- barr[, match(.disp, labs), drop = TRUE, dimnames = FALSE]
+    cln <- cleaned_signals[[.disp]]$`@impl`[drop = TRUE, dimnames = FALSE]
+    sr <- cleaned_signals[[.disp]]$`@impl`$get_header("sample_rate")
+    plot_before_after(raw, cln, sample_rate = sr,
+                      time_range = c(0, min(5, (length(raw) - 1) / sr)),
+                      main = sprintf("Original vs cleaned - channel %s (first 5 s)", .disp))
+  }
+})
+```
+
+**Welch periodogram before vs after cleaning** - the stim-frequency comb should be further
+attenuated relative to the bipolar-only trace.
+
+```{r diag_pwelch_clean, echo=FALSE, fig.height=4}
+try({
+  if (!is.null(.disp)) {
+    barr <- bipolar_signals$`@impl`
+    labs <- dimnames(barr)$Electrode
+    raw <- barr[, match(.disp, labs), drop = TRUE, dimnames = FALSE]
+    cln <- cleaned_signals[[.disp]]$`@impl`[drop = TRUE, dimnames = FALSE]
+    sr <- cleaned_signals[[.disp]]$`@impl`$get_header("sample_rate")
+    harmonics <- as.numeric(stim_frequency) * seq_len(10)
+    plot_pwelch_compare(
+      traces = stats::setNames(list(raw, cln), c("bipolar", "cleaned")),
+      sample_rate = sr, win_sec = 1, max_freq = 500, marks = harmonics,
+      main = sprintf("Bipolar vs cleaned periodogram - channel %s", .disp)
+    )
+  }
+})
+```
+
+# Build, Visualize, & Run
+
+Please make sure the following code block is at the end of your pipeline file. This block
+builds the pipeline and generates a `make-stim_artifact_removal.R` script.
+
+```{r build, echo=FALSE, results='hide'}
+build_pipeline(make_file = "make-stim_artifact_removal.R")
+```
+
+```{r visualize, echo=FALSE}
+# Fixed usage, show pipeline graph
+try({
+  ravepipeline:::pipeline_dependency_graph(
+    pipeline_path = ".", glimpse = TRUE)
+}, silent = TRUE)
+```

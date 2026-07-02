@@ -1,0 +1,18 @@
+Package: stim_artifact_removal
+Type: rave-pipeline
+Title: Remove Electrical Stimulation Artifacts From Raw 'iEEG' Voltage
+Version: 0.0.1
+Language: en-US
+Encoding: UTF-8
+License: MIT
+Authors@R: c(
+    person("Zhengjia", "Wang", email = "zhengjia.wang@pennmedicine.upenn.edu", role = c("aut", "cre"))
+    )
+Description:
+    Removes electrical stimulation artifacts from raw intracranial voltage
+    traces using per-pulse template subtraction, principal-component
+    inspection of residual artifact bases, and moving-average gap-filling of
+    the blanked stimulation window. Produces cleaned per-block voltage traces
+    that can be exported back to the 'RAVE' subject for downstream processing.
+BugReports: https://github.com/orgs/rave-ieeg/discussions
+URL: https://rave.wiki, https://github.com/rave-ieeg/rave-pipelines

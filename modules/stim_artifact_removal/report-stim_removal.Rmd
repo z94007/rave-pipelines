@@ -1,0 +1,105 @@
+---
+title: "Stim Artifact Removal Report"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: true
+    toc_depth: 3
+    df_print: kable
+    theme: spacelab
+params:
+  recording_block: ~
+  time_range: ~
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = NA,
+  rows.print = 10, fig.width = 12
+)
+
+pipeline <- ravepipeline::pipeline_from_path(".")
+
+# Bring settings + shared-*.R functions (plots, helpers) into scope
+shared_env <- pipeline$shared_env()
+settings <- pipeline$get_settings()
+list2env(settings, envir = globalenv())
+list2env(as.list(shared_env), envir = globalenv())
+
+# Run / read the required targets
+pipeline$run(
+  scheduler = "none", type = "smart", return_values = FALSE,
+  names = c("subject", "loaded_signals", "aligned_pulse_list",
+            "snippet_list", "template_list", "cleaned_signals")
+)
+
+subject         <- pipeline$read("subject")
+loaded_signals  <- pipeline$read("loaded_signals")
+snippet_list    <- pipeline$read("snippet_list")
+template_list   <- pipeline$read("template_list")
+cleaned_signals <- pipeline$read("cleaned_signals")
+
+all_blocks <- names(loaded_signals)
+report_block <- params$recording_block
+if (!length(report_block) || is.na(report_block) || !report_block %in% all_blocks) {
+  report_block <- all_blocks[[1]]
+}
+
+time_range <- params$time_range
+if (length(time_range) != 2 || all(is.na(time_range))) {
+  time_range <- c(NA, NA)
+}
+
+snip <- snippet_list[[report_block]]
+tmpl <- template_list[[report_block]]
+```
+
+Subject: **`r subject$subject_id`** &middot; block: **`r report_block`**
+&middot; detection: **`r detection_source`**
+
+## Aligned pulses & estimated template
+
+```{r snippets, fig.width=12, fig.height=5}
+if (is.list(snip) && ncol(snip$snips) > 0) {
+  template_full <- if (is.list(tmpl)) tmpl$template$template_full else NULL
+  plot_pulse_snippets_overlay(
+    snips = snip$snips, sample_rate = snip$sample_rate,
+    pre = snip$pre, template_full = template_full)
+} else {
+  plot.new(); text(0.5, 0.5, "No aligned pulses for this block")
+}
+```
+
+```{r template, fig.width=12, fig.height=5}
+if (is.list(tmpl)) {
+  plot_template_waveform(
+    template_full = tmpl$template$template_full,
+    sample_rate = tmpl$sample_rate,
+    blank_width = length(tmpl$template$blank_rows),
+    pre = tmpl$pre)
+} else {
+  plot.new(); text(0.5, 0.5, "No template estimated for this block")
+}
+```
+
+## Pulse PCA scores
+
+```{r pca, fig.width=8, fig.height=6}
+if (is.list(tmpl) && is.list(tmpl$pca)) {
+  plot_pca_scatter(tmpl$pca)
+} else {
+  plot.new(); text(0.5, 0.5, "PCA not available")
+}
+```
+
+## Original vs cleaned
+
+```{r before_after, fig.width=12, fig.height=5}
+raw_arr <- loaded_signals[[report_block]]$`@impl`
+cln_arr <- cleaned_signals[[report_block]]$`@impl`
+raw <- raw_arr[drop = TRUE, dimnames = FALSE]
+cln <- cln_arr[drop = TRUE, dimnames = FALSE]
+sample_rate <- cln_arr$get_header("sample_rate")
+plot_before_after(raw, cln, sample_rate = sample_rate, time_range = time_range)
+```

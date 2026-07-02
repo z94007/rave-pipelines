@@ -1,0 +1,29 @@
+# ---- Data selection (loading) ----
+project_name: McGurkStim
+subject_code: PAV073
+loaded_electrodes: '1,2,37,38,39,40'      # contacts to load into the repository (subset for speed)
+loaded_blocks: ~                           # ~ = all imported blocks
+
+# ---- Analysis selection (one block at a time) ----
+analysis_block: BLOCK031_McGurkAVAestimV2
+analysis_electrodes: ~                      # ~ = all loaded LFP contacts except the stim electrode
+stim_electrode: 38                          # stim contact for THIS block (clearest square pulses)
+
+# ---- Pulse detection (threshold the stim electrode) ----
+stim_threshold: 3000                        # |amplitude| threshold on the stim channel (rails at +/- full-scale)
+stim_frequency: 50                          # Hz, pulse rate within a train
+stim_train_duration: 0.5                    # s, duration of each stimulation train
+pulse_duration: 0.5                         # ms, single-pulse width hint
+snip_window: ~                              # samples per pulse window; ~ = round(sample_rate / stim_frequency)
+
+# ---- Alignment & template ----
+align_search_start: 15                      # first snippet row of the min/max alignment search window
+align_search_end: 20                        # last snippet row of the alignment search window
+artifact_blank_width: 20                    # leading samples blanked as the direct (saturated) artifact
+template_window_pre: 0                      # extra samples before onset included in each snippet
+n_clusters: 1                               # per-channel artifact templates (1 = MATLAB single template)
+pca_n_components: 2                         # principal components computed for the pulse scatter
+
+# ---- Gap fill & export ----
+gap_fill_window: 101                        # moving-average window used to fill blanked samples (MATLAB maWin)
+export_name: cleaned                        # name used when exporting the cleaned voltage
