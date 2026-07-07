@@ -225,6 +225,78 @@ detect_pulses_from_epoch <- function(epoch_table, block, sample_rate,
 }
 
 
+# ---- Detection: Events / sync channel (preferred, MATLAB-faithful) -----------
+
+#' Robust threshold for a bimodal (square-wave) channel: the midpoint between the
+#' low and high modes, estimated from the 2nd/98th percentiles to ignore spikes.
+bimodal_threshold <- function(x) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  if (!length(x)) { return(0) }
+  q <- stats::quantile(x, c(0.02, 0.98), names = FALSE)
+  as.numeric(q[[1]] + 0.5 * (q[[2]] - q[[1]]))
+}
+
+#' Auto-detect the Events / sync channel among the subject's Auxiliary channels
+#' by SHAPE: the clean square wave has almost no samples at intermediate levels
+#' (high "squareness") and a plausible number of train edges. RAVE does not
+#' preserve the original "Events" channel name (labels become `NoLabel`), so we
+#' identify it from the waveform. Returns the electrode number, or `NULL`.
+auto_detect_event_channel <- function(subject, block, aux_electrodes = NULL) {
+  if (is.null(aux_electrodes)) {
+    aux_electrodes <- subject$electrodes[subject$electrode_types == "Auxiliary"]
+  }
+  aux_electrodes <- as.integer(aux_electrodes)
+  if (!length(aux_electrodes)) { return(NULL) }
+
+  repo <- ravecore::prepare_subject_raw_voltage_with_blocks(
+    subject = subject, electrodes = aux_electrodes,
+    blocks = block, downsample = NA)
+  container <- repo$get_container()[[as.character(block)]]
+
+  best <- NULL
+  best_score <- -Inf
+  for (ch in aux_electrodes) {
+    ex <- extract_block_signal(container, ch)
+    x <- as.numeric(ex$data[, 1])
+    n <- length(x)
+    sr <- ex$sample_rate
+    rng <- range(x, na.rm = TRUE)
+    span <- diff(rng)
+    if (!isTRUE(span > 0)) { next }
+
+    lo <- rng[[1]] + 0.1 * span
+    hi <- rng[[2]] - 0.1 * span
+    mid_mass <- mean(x >= lo & x <= hi, na.rm = TRUE)      # low => square
+    squareness <- 1 - mid_mass
+
+    thr <- bimodal_threshold(x)
+    n_rise <- sum(diff(c(0L, as.integer(x > thr), 0L)) == 1L)
+    duration_sec <- n / sr
+    if (n_rise < 2L || n_rise > duration_sec * 10) { next } # implausible train count
+
+    if (squareness > best_score) { best_score <- squareness; best <- ch }
+  }
+  best
+}
+
+#' Detect pulse onsets from the Events / sync channel. The channel is high for
+#' the whole train; `detect_pulses_from_trigger` finds each train as a connected
+#' component and lays `stim_frequency * stim_train_duration` evenly spaced onsets
+#' inside it (MATLAB `linspace`). The threshold is auto-estimated (bimodal) unless
+#' supplied.
+detect_pulses_from_events <- function(events_signal, sample_rate, stim_frequency,
+                                      stim_train_duration, pulse_duration_sec = 0,
+                                      threshold = NULL) {
+  events_signal <- as.numeric(events_signal)
+  if (is.null(threshold)) { threshold <- bimodal_threshold(events_signal) }
+  detect_pulses_from_trigger(
+    trigger = events_signal, sample_rate = sample_rate, threshold = threshold,
+    stim_frequency = stim_frequency, stim_length = stim_train_duration,
+    pulse_duration_sec = pulse_duration_sec)
+}
+
+
 # ---- Snippet extraction (MATLAB `snips(:,i)=bipolar(loc:loc+snipWin)`) --------
 
 #' Extract per-pulse snippets into a (samples x pulses) matrix.

@@ -56,6 +56,9 @@ rm(._._env_._.)
         }), deps = "settings"), input_stim_threshold = targets::tar_target_raw("stim_threshold", 
         quote({
             settings[["stim_threshold"]]
+        }), deps = "settings"), input_event_channel = targets::tar_target_raw("event_channel", 
+        quote({
+            settings[["event_channel"]]
         }), deps = "settings"), input_stim_electrode = targets::tar_target_raw("stim_electrode", 
         quote({
             settings[["stim_electrode"]]
@@ -302,14 +305,34 @@ rm(._._env_._.)
         pattern = NULL, iteration = "list"), detect_pulses = targets::tar_target_raw(name = "pulse_info", 
         command = quote({
             .__target_expr__. <- quote({
-                stim <- load_stim_channel(repository, stim_electrode, 
-                  block = analysis_block)
-                sample_rate <- stim$sample_rate
-                info <- detect_pulses_from_stim_channel(signal = stim$data, 
-                  sample_rate = sample_rate, threshold = as.numeric(stim_threshold), 
-                  stim_frequency = as.numeric(stim_frequency), 
-                  refractory_frac = 0.8, pulse_duration_sec = as.numeric(pulse_duration)/1000)
-                info$sample_rate <- sample_rate
+                ec <- suppressWarnings(as.integer(dipsaus::parse_svec(event_channel)))
+                ec <- ec[is.finite(ec)]
+                if (!length(ec)) {
+                  ec <- tryCatch(auto_detect_event_channel(subject, 
+                    analysis_block), error = function(e) NULL)
+                }
+                if (length(ec) && !is.na(ec[[1]]) && ec[[1]] %in% 
+                  subject$electrodes) {
+                  ev <- load_stim_channel(repository, ec[[1]], 
+                    block = analysis_block)
+                  info <- detect_pulses_from_events(events_signal = ev$data, 
+                    sample_rate = ev$sample_rate, stim_frequency = as.numeric(stim_frequency), 
+                    stim_train_duration = as.numeric(stim_train_duration), 
+                    pulse_duration_sec = as.numeric(pulse_duration)/1000)
+                  info$sample_rate <- ev$sample_rate
+                  info$detection_source <- "events"
+                  info$event_channel <- ec[[1]]
+                } else {
+                  stim <- load_stim_channel(repository, stim_electrode, 
+                    block = analysis_block)
+                  info <- detect_pulses_from_stim_channel(signal = stim$data, 
+                    sample_rate = stim$sample_rate, threshold = as.numeric(stim_threshold), 
+                    stim_frequency = as.numeric(stim_frequency), 
+                    refractory_frac = 0.8, pulse_duration_sec = as.numeric(pulse_duration)/1000)
+                  info$sample_rate <- stim$sample_rate
+                  info$detection_source <- "stim_electrode"
+                  info$event_channel <- NA_integer_
+                }
                 info$block <- as.character(analysis_block)
                 info$stim_electrode <- stim_electrode
                 pulse_info <- info
@@ -324,25 +347,47 @@ rm(._._env_._.)
         }), format = asNamespace("ravepipeline")$target_format_dynamic(name = NULL, 
             target_export = "pulse_info", target_expr = quote({
                 {
-                  stim <- load_stim_channel(repository, stim_electrode, 
-                    block = analysis_block)
-                  sample_rate <- stim$sample_rate
-                  info <- detect_pulses_from_stim_channel(signal = stim$data, 
-                    sample_rate = sample_rate, threshold = as.numeric(stim_threshold), 
-                    stim_frequency = as.numeric(stim_frequency), 
-                    refractory_frac = 0.8, pulse_duration_sec = as.numeric(pulse_duration)/1000)
-                  info$sample_rate <- sample_rate
+                  ec <- suppressWarnings(as.integer(dipsaus::parse_svec(event_channel)))
+                  ec <- ec[is.finite(ec)]
+                  if (!length(ec)) {
+                    ec <- tryCatch(auto_detect_event_channel(subject, 
+                      analysis_block), error = function(e) NULL)
+                  }
+                  if (length(ec) && !is.na(ec[[1]]) && ec[[1]] %in% 
+                    subject$electrodes) {
+                    ev <- load_stim_channel(repository, ec[[1]], 
+                      block = analysis_block)
+                    info <- detect_pulses_from_events(events_signal = ev$data, 
+                      sample_rate = ev$sample_rate, stim_frequency = as.numeric(stim_frequency), 
+                      stim_train_duration = as.numeric(stim_train_duration), 
+                      pulse_duration_sec = as.numeric(pulse_duration)/1000)
+                    info$sample_rate <- ev$sample_rate
+                    info$detection_source <- "events"
+                    info$event_channel <- ec[[1]]
+                  } else {
+                    stim <- load_stim_channel(repository, stim_electrode, 
+                      block = analysis_block)
+                    info <- detect_pulses_from_stim_channel(signal = stim$data, 
+                      sample_rate = stim$sample_rate, threshold = as.numeric(stim_threshold), 
+                      stim_frequency = as.numeric(stim_frequency), 
+                      refractory_frac = 0.8, pulse_duration_sec = as.numeric(pulse_duration)/1000)
+                    info$sample_rate <- stim$sample_rate
+                    info$detection_source <- "stim_electrode"
+                    info$event_channel <- NA_integer_
+                  }
                   info$block <- as.character(analysis_block)
                   info$stim_electrode <- stim_electrode
                   pulse_info <- info
                 }
                 pulse_info
-            }), target_depends = c("repository", "stim_electrode", 
-            "analysis_block", "stim_threshold", "stim_frequency", 
-            "pulse_duration")), deps = c("repository", "stim_electrode", 
-        "analysis_block", "stim_threshold", "stim_frequency", 
-        "pulse_duration"), cue = targets::tar_cue("thorough"), 
-        pattern = NULL, iteration = "list"), build_bipolar_pairs = targets::tar_target_raw(name = "bipolar_pairs", 
+            }), target_depends = c("event_channel", "subject", 
+            "analysis_block", "repository", "stim_frequency", 
+            "stim_train_duration", "pulse_duration", "stim_electrode", 
+            "stim_threshold")), deps = c("event_channel", "subject", 
+        "analysis_block", "repository", "stim_frequency", "stim_train_duration", 
+        "pulse_duration", "stim_electrode", "stim_threshold"), 
+        cue = targets::tar_cue("thorough"), pattern = NULL, iteration = "list"), 
+    build_bipolar_pairs = targets::tar_target_raw(name = "bipolar_pairs", 
         command = quote({
             .__target_expr__. <- quote({
                 electrode_table <- subject$get_electrode_table()

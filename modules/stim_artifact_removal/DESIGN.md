@@ -53,17 +53,21 @@ Load unreferenced, un-notched, non-epoched voltage for the chosen contacts
 ### Stage 2 — Pulse detection
 Recover one onset per pulse. **Two sources, in priority order:**
 
-1. **Events channel (preferred)** **[Designed]** — one of the subject's Auxiliary channels
+1. **Events channel (preferred)** **[Built]** — one of the subject's Auxiliary channels
    carries a clean square wave whose rising/falling edges mark train **onset/offset**. Detect
    train boundaries from the edges, then lay `stim_frequency × stim_train_duration` evenly
-   spaced onsets within each train (`detect_pulses_from_trigger`, the MATLAB `linspace`
-   method). This is the robust source and matches the prototype.
-   - Auto-fill the Events channel, **user-editable**. RAVE stores the three aux channels as
-     electrodes **257–259** but drops their original names to `NoLabel`, so auto-fill must key
-     off the raw channel names (if reachable) or square-wave shape detection, not the RAVE
-     `Label`. *(Open lookup — see §8.)*
-   - Note: this makes `stim_train_duration` **load-bearing** (it sets the pulse count per
-     train), so it is *not* dead under this design.
+   spaced onsets within each train (`detect_pulses_from_events` → `detect_pulses_from_trigger`,
+   the MATLAB `linspace` method), after an auto (bimodal) threshold. This is the robust source
+   and matches the prototype.
+   - **Auto-detected by shape**, **user-editable** via `event_channel`. RAVE drops the aux
+     channels' original names to `NoLabel`, so `auto_detect_event_channel` identifies the
+     square wave by waveform: among the Auxiliary channels, the one with almost no samples at
+     intermediate levels ("squareness") and a plausible train-edge count. For PAV073 this
+     resolves to **electrode 259** (46 trains → 1150 pulses in BLOCK031, onsets matching the
+     `stimpulse_*` epoch tables to the millisecond). The three aux channels are 257–259; 258
+     is a noisy analog line, 257 is not square.
+   - This makes `stim_train_duration` **load-bearing** (it sets the pulse count per train), so
+     it is *not* dead under this design.
 
 2. **Stim electrode threshold (fallback)** **[Built]** — when no Events channel is available,
    threshold the stim electrode's own saturating signal. It rails in *both* directions and
@@ -129,8 +133,9 @@ not yet built.
 
 Loading: `project_name`, `subject_code`, `loaded_electrodes`, `loaded_blocks`.
 Analysis (per block): `analysis_block`, `analysis_electrodes`, `stim_electrode`.
-Detection: `stim_threshold`, `stim_frequency`, `stim_train_duration`, `pulse_duration`,
-`snip_window`. **[Designed]** add `event_channel` (auto-filled aux channel, editable).
+Detection: `event_channel` (**[Built]**; `~` = auto-detect the square-wave aux channel,
+editable), `stim_threshold` (fallback only), `stim_frequency`, `stim_train_duration`,
+`pulse_duration`, `snip_window`.
 Alignment/template: `align_search_start`, `align_search_end`, `artifact_blank_width`,
 `template_window_pre`, `n_clusters`, `pca_n_components`.
 Gap fill / export: `gap_fill_window`, `export_name`.
@@ -166,10 +171,10 @@ within-shaft stim-aware bipolar pairing; `ravetools::pwelch` diagnostics.
 
 ## 8. Open / parked items
 
-- **[Open]** Identify the Events channel among aux 257–259 and where RAVE (if at all) keeps
-  original Blackrock channel names, to drive auto-fill. Fallback: square-wave shape detection.
-- **[Designed, not built]** Events-channel detection path wired as primary (function exists:
-  `detect_pulses_from_trigger`); `event_channel` setting with auto-fill.
+- **[Resolved]** Events channel identified by **shape** (`auto_detect_event_channel`) rather
+  than the lost Blackrock name; wired as the primary detector with the stim-electrode fallback.
+  The `stimpulse_*` epoch tables (train onsets, produced upstream by `stimpulse_finder`) are a
+  *third* possible source not yet used — worth considering if epochs are always present.
 - **[Designed, not built]** Draggable alignment-window selector on the snippet plot (Shiny).
 - **[Designed, not built]** Reference-based export so downstream loads cleaned data as no-stim.
 - **[Parked]** Bipolar-stim support (skip both stim contacts in pairing).
@@ -184,8 +189,9 @@ within-shaft stim-aware bipolar pairing; `ravetools::pwelch` diagnostics.
 
 ## 9. Status summary
 
-Built and verified end-to-end: the four stages with the **stim-electrode fallback** detector,
-knitting to HTML for `McGurkStim / PAV073`, stim electrode 38, with per-section documentation
-and diagnostic plots. The Events-first detection, alignment-window UI, and reference export are
-designed here and not yet implemented. The Shiny `module_*.R` / `report-stim_removal.Rmd` still
-reference the older block-keyed target shape and need realignment to the per-channel structure.
+Built and verified end-to-end: the four stages with **Events-channel-first detection** (auto
+channel 259 → 1150 pulses for PAV073 / BLOCK031) and the stim-electrode fallback, knitting to
+HTML for `McGurkStim / PAV073`, stim electrode 38, with per-section documentation and all ten
+diagnostic plots. Still designed-not-built: the alignment-window UI and reference-based export.
+The Shiny `module_*.R` / `report-stim_removal.Rmd` still reference the older block-keyed target
+shape and need realignment to the per-channel structure.

@@ -9,8 +9,9 @@ analysis_block: BLOCK031_McGurkAVAestimV2
 analysis_electrodes: ~                      # ~ = all loaded LFP contacts except the stim electrode
 stim_electrode: 38                          # stim contact for THIS block (clearest square pulses)
 
-# ---- Pulse detection (threshold the stim electrode) ----
-stim_threshold: 3000                        # |amplitude| threshold on the stim channel (rails at +/- full-scale)
+# ---- Pulse detection ----
+event_channel: ~                            # Events/sync channel; ~ = auto-detect the square-wave aux channel
+stim_threshold: 3000                        # |amplitude| threshold on the stim channel (fallback detector)
 stim_frequency: 50                          # Hz, pulse rate within a train
 stim_train_duration: 0.5                    # s, duration of each stimulation train
 pulse_duration: 0.5                         # ms, single-pulse width hint

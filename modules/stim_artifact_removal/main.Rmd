@@ -160,55 +160,86 @@ try({
 
 # Section 2 — Pulse detection
 
-We recover per-pulse timing by thresholding the stim electrode. Unlike a dedicated sync /
-"Events" channel (which stays high for a whole train, as in the MATLAB prototype), the
-stim electrode fires one saturating square pulse at a time and **rails in both directions**
-(±full-scale), so each biphasic pulse crosses the threshold several times. We therefore
-threshold the **absolute value** (`stim_threshold`) and coalesce crossings with a
-**refractory period**: an onset is kept only if it is at least 0.8 of one inter-pulse
-interval after the previous kept onset. This collapses the multiple within-pulse crossings
-into a single, reliable timestamp per pulse, while genuine pulse-to-pulse gaps (≈
-`sample_rate / stim_frequency` samples at `stim_frequency`) are preserved. These onsets,
-shared across all channels of this block, index the snippets used downstream. The per-pulse
+We recover one onset per pulse, from two sources in priority order.
+
+**Preferred — the Events / sync channel.** One of the subject's Auxiliary channels carries a
+clean square wave that is **high for the entire stim train**; its rising/falling edges mark
+train onset and offset (exactly as the MATLAB prototype used the "Events" channel). RAVE does
+not preserve the original channel name (all labels become `NoLabel`), so we identify it by
+**shape**: among the aux channels, the one with almost no samples at intermediate levels and a
+plausible number of train edges (`auto_detect_event_channel`; overridable via `event_channel`).
+Each train is then split into `stim_frequency × stim_train_duration` evenly spaced onsets with
+`linspace` — the MATLAB method — after an auto (bimodal) threshold.
+
+**Fallback — the stim electrode.** When no Events channel exists we threshold the stim
+electrode's own saturating signal. It rails in both directions and each biphasic pulse crosses
+threshold several times, so we threshold the **absolute value** (`stim_threshold`) and coalesce
+crossings with a **refractory period** (0.8 × inter-pulse interval) to keep one onset per pulse.
+
+Either way, onsets are detected once per block, shared across all channels. The per-pulse
 window is `snip_window = round(sample_rate / stim_frequency)` (one inter-pulse interval).
 
 ```{rave detect_pulses, language = "R", export = "pulse_info"}
-stim <- load_stim_channel(repository, stim_electrode, block = analysis_block)
-sample_rate <- stim$sample_rate
+# Resolve the Events channel: explicit setting, else auto-detect the square-wave
+# aux channel. Prefer it; fall back to thresholding the stim electrode.
+ec <- suppressWarnings(as.integer(dipsaus::parse_svec(event_channel)))
+ec <- ec[is.finite(ec)]
+if (!length(ec)) {
+  ec <- tryCatch(auto_detect_event_channel(subject, analysis_block),
+                 error = function(e) NULL)
+}
 
-info <- detect_pulses_from_stim_channel(
-  signal = stim$data,
-  sample_rate = sample_rate,
-  threshold = as.numeric(stim_threshold),
-  stim_frequency = as.numeric(stim_frequency),
-  refractory_frac = 0.8,
-  pulse_duration_sec = as.numeric(pulse_duration) / 1000
-)
-info$sample_rate <- sample_rate
+if (length(ec) && !is.na(ec[[1]]) && ec[[1]] %in% subject$electrodes) {
+  ev <- load_stim_channel(repository, ec[[1]], block = analysis_block)
+  info <- detect_pulses_from_events(
+    events_signal = ev$data, sample_rate = ev$sample_rate,
+    stim_frequency = as.numeric(stim_frequency),
+    stim_train_duration = as.numeric(stim_train_duration),
+    pulse_duration_sec = as.numeric(pulse_duration) / 1000
+  )
+  info$sample_rate <- ev$sample_rate
+  info$detection_source <- "events"
+  info$event_channel <- ec[[1]]
+} else {
+  stim <- load_stim_channel(repository, stim_electrode, block = analysis_block)
+  info <- detect_pulses_from_stim_channel(
+    signal = stim$data, sample_rate = stim$sample_rate,
+    threshold = as.numeric(stim_threshold),
+    stim_frequency = as.numeric(stim_frequency),
+    refractory_frac = 0.8,
+    pulse_duration_sec = as.numeric(pulse_duration) / 1000
+  )
+  info$sample_rate <- stim$sample_rate
+  info$detection_source <- "stim_electrode"
+  info$event_channel <- NA_integer_
+}
 info$block <- as.character(analysis_block)
 info$stim_electrode <- stim_electrode
 pulse_info <- info
 ```
 
-The detected onsets (red) on the stim trace, zoomed to the first train, and the raw
-per-pulse snippets cut at those onsets (MATLAB `plot(snips)`) - before alignment they are
-jittered by up to a few samples.
+The detected onsets (red) on the detection channel, zoomed to the first train, and the raw
+per-pulse snippets cut at those onsets on the stim electrode (MATLAB `plot(snips)`) — before
+alignment they are jittered by up to a few samples.
 
 ```{r diag_detection, echo=FALSE, fig.height=3.5}
 try({
-  stim <- load_stim_channel(repository, stim_electrode, block = analysis_block)
-  sr <- stim$sample_rate
   if (isTRUE(pulse_info$n_pulses > 0)) {
+    src <- pulse_info$detection_source
+    det_ch <- if (identical(src, "events")) pulse_info$event_channel else stim_electrode
+    chan <- load_stim_channel(repository, det_ch, block = analysis_block)
+    sr <- chan$sample_rate
     first_on <- pulse_info$onset_index[[1]]
     plot_stim_trace_with_onsets(
-      trace = stim$data, sample_rate = sr, onsets = pulse_info$onset_index,
-      threshold = as.numeric(stim_threshold),
+      trace = chan$data, sample_rate = sr, onsets = pulse_info$onset_index,
+      threshold = NULL,
       time_range = c(max(0, (first_on / sr) - 0.05), (first_on / sr) + 0.6),
-      main = sprintf("Detected onsets - %d pulses in block %s",
-                     pulse_info$n_pulses, analysis_block)
+      main = sprintf("%s %s + detected onsets (%d pulses · source: %s)",
+                     if (identical(src, "events")) "Events channel" else "Stim electrode",
+                     det_ch, pulse_info$n_pulses, src)
     )
   } else {
-    plot.new(); text(0.5, 0.5, "No pulses detected (check stim_threshold / stim_electrode)")
+    plot.new(); text(0.5, 0.5, "No pulses detected (check event_channel / stim_threshold)")
   }
 })
 ```
