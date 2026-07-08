@@ -23,6 +23,9 @@ rm(._._env_._.)
         }), deps = "settings"), input_gap_fill_window = targets::tar_target_raw("gap_fill_window", 
         quote({
             settings[["gap_fill_window"]]
+        }), deps = "settings"), input_template_electrodes = targets::tar_target_raw("template_electrodes", 
+        quote({
+            settings[["template_electrodes"]]
         }), deps = "settings"), input_pca_n_components = targets::tar_target_raw("pca_n_components", 
         quote({
             settings[["pca_n_components"]]
@@ -675,33 +678,56 @@ rm(._._env_._.)
             .__target_expr__. <- quote({
                 block <- as.character(analysis_block)
                 gap_win <- as.integer(gap_fill_window)
+                blank_width <- as.integer(artifact_blank_width)
                 filearray_root <- file.path(pipeline$pipeline_path, 
                   "data", "cleaned-voltage")
+                te <- dipsaus::parse_svec(template_electrodes)
+                pair_is_near <- function(lab) {
+                  if (!length(te)) {
+                    return(TRUE)
+                  }
+                  row <- bipolar_pairs[bipolar_pairs$label == 
+                    lab, , drop = FALSE]
+                  if (!nrow(row)) {
+                    return(TRUE)
+                  }
+                  isTRUE(row$anode[[1]] %in% te) || isTRUE(row$cathode[[1]] %in% 
+                    te)
+                }
                 cleaned_signals <- list()
-                if (length(template_list) && !is.null(bipolar_signals)) {
+                if (length(aligned_pulse_list) && !is.null(bipolar_signals)) {
                   barr <- bipolar_signals$`@impl`
-                  labs <- names(template_list)
+                  labs <- names(aligned_pulse_list)
                   time <- as.numeric(dimnames(barr)$Time)
                   cleaned_signals <- structure(names = labs, 
                     lapply(seq_along(labs), function(j) {
-                      tmpl <- template_list[[j]]
+                      lab <- labs[[j]]
                       al <- aligned_pulse_list[[j]]
+                      tmpl <- template_list[[lab]]
                       trace <- barr[, j, drop = TRUE, dimnames = FALSE]
-                      if (is.null(tmpl) || !isTRUE(al$n_pulses > 
-                        0)) {
+                      near <- pair_is_near(lab)
+                      if (!isTRUE(al$n_pulses > 0)) {
                         cleaned <- as.numeric(trace)
-                      } else {
+                        method <- "none"
+                      } else if (near && !is.null(tmpl)) {
                         cleaned <- subtract_cluster_templates_and_fill(signal = trace, 
                           snips = al$snips, onset_index = al$onset_index, 
                           pre = al$pre, cluster_templates = tmpl$cluster_templates, 
                           gap_fill_window = gap_win)
+                        method <- "bipolar+template"
+                      } else {
+                        cleaned <- blank_direct_artifact_and_fill(signal = trace, 
+                          onset_index = al$onset_index, snip_window = al$snip_window, 
+                          blank_width = blank_width, pre = al$pre, 
+                          gap_fill_window = gap_win)
+                        method <- "bipolar+direct"
                       }
                       new_rave_filearray(filebase = file.path(filearray_root, 
-                        sprintf("%s_%s", block, labs[[j]])), 
-                        data = matrix(cleaned, ncol = 1L), dimnames_list = list(Time = time, 
-                          Electrode = labs[[j]]), headers = list(block = block, 
-                          channel = labs[[j]], sample_rate = barr$get_header("sample_rate"), 
-                          n_pulses = al$n_pulses, cleaning_method = "template_subtraction"))
+                        sprintf("%s_%s", block, lab)), data = matrix(cleaned, 
+                        ncol = 1L), dimnames_list = list(Time = time, 
+                        Electrode = lab), headers = list(block = block, 
+                        channel = lab, sample_rate = barr$get_header("sample_rate"), 
+                        n_pulses = al$n_pulses, cleaning_method = method))
                     }))
                 }
             })
@@ -717,41 +743,65 @@ rm(._._env_._.)
                 {
                   block <- as.character(analysis_block)
                   gap_win <- as.integer(gap_fill_window)
+                  blank_width <- as.integer(artifact_blank_width)
                   filearray_root <- file.path(pipeline$pipeline_path, 
                     "data", "cleaned-voltage")
+                  te <- dipsaus::parse_svec(template_electrodes)
+                  pair_is_near <- function(lab) {
+                    if (!length(te)) {
+                      return(TRUE)
+                    }
+                    row <- bipolar_pairs[bipolar_pairs$label == 
+                      lab, , drop = FALSE]
+                    if (!nrow(row)) {
+                      return(TRUE)
+                    }
+                    isTRUE(row$anode[[1]] %in% te) || isTRUE(row$cathode[[1]] %in% 
+                      te)
+                  }
                   cleaned_signals <- list()
-                  if (length(template_list) && !is.null(bipolar_signals)) {
+                  if (length(aligned_pulse_list) && !is.null(bipolar_signals)) {
                     barr <- bipolar_signals$`@impl`
-                    labs <- names(template_list)
+                    labs <- names(aligned_pulse_list)
                     time <- as.numeric(dimnames(barr)$Time)
                     cleaned_signals <- structure(names = labs, 
                       lapply(seq_along(labs), function(j) {
-                        tmpl <- template_list[[j]]
+                        lab <- labs[[j]]
                         al <- aligned_pulse_list[[j]]
+                        tmpl <- template_list[[lab]]
                         trace <- barr[, j, drop = TRUE, dimnames = FALSE]
-                        if (is.null(tmpl) || !isTRUE(al$n_pulses > 
-                          0)) {
+                        near <- pair_is_near(lab)
+                        if (!isTRUE(al$n_pulses > 0)) {
                           cleaned <- as.numeric(trace)
-                        } else {
+                          method <- "none"
+                        } else if (near && !is.null(tmpl)) {
                           cleaned <- subtract_cluster_templates_and_fill(signal = trace, 
                             snips = al$snips, onset_index = al$onset_index, 
                             pre = al$pre, cluster_templates = tmpl$cluster_templates, 
                             gap_fill_window = gap_win)
+                          method <- "bipolar+template"
+                        } else {
+                          cleaned <- blank_direct_artifact_and_fill(signal = trace, 
+                            onset_index = al$onset_index, snip_window = al$snip_window, 
+                            blank_width = blank_width, pre = al$pre, 
+                            gap_fill_window = gap_win)
+                          method <- "bipolar+direct"
                         }
                         new_rave_filearray(filebase = file.path(filearray_root, 
-                          sprintf("%s_%s", block, labs[[j]])), 
-                          data = matrix(cleaned, ncol = 1L), 
-                          dimnames_list = list(Time = time, Electrode = labs[[j]]), 
-                          headers = list(block = block, channel = labs[[j]], 
-                            sample_rate = barr$get_header("sample_rate"), 
-                            n_pulses = al$n_pulses, cleaning_method = "template_subtraction"))
+                          sprintf("%s_%s", block, lab)), data = matrix(cleaned, 
+                          ncol = 1L), dimnames_list = list(Time = time, 
+                          Electrode = lab), headers = list(block = block, 
+                          channel = lab, sample_rate = barr$get_header("sample_rate"), 
+                          n_pulses = al$n_pulses, cleaning_method = method))
                       }))
                   }
                 }
                 cleaned_signals
             }), target_depends = c("analysis_block", "gap_fill_window", 
-            "template_list", "bipolar_signals", "aligned_pulse_list"
+            "artifact_blank_width", "template_electrodes", "bipolar_pairs", 
+            "aligned_pulse_list", "bipolar_signals", "template_list"
             )), deps = c("analysis_block", "gap_fill_window", 
-        "template_list", "bipolar_signals", "aligned_pulse_list"
+        "artifact_blank_width", "template_electrodes", "bipolar_pairs", 
+        "aligned_pulse_list", "bipolar_signals", "template_list"
         ), cue = targets::tar_cue("thorough"), pattern = NULL, 
         iteration = "list"))

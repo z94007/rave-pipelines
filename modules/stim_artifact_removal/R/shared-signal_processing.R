@@ -484,7 +484,7 @@ new_rave_filearray <- function(filebase, data, dimnames_list = NULL, headers = l
   farr[] <- data
   if (!is.null(dimnames_list)) { dimnames(farr) <- dimnames_list }
   for (nm in names(headers)) {
-    farr$set_header(nm, headers[[nm]], save = FALSE)
+    farr$set_header(nm, headers[[nm]], save = TRUE)   # persist so headers survive reload
   }
   ravepipeline::RAVEFileArray$new(x = farr, temporary = FALSE)
 }
@@ -756,4 +756,114 @@ subtract_cluster_templates_and_fill <- function(signal, snips, onset_index, pre,
   cleaned <- fill_missing_movmean(cleaned, window = gap_fill_window)
   cleaned <- fill_missing_nearest(cleaned)
   cleaned
+}
+
+
+# ---- Direct-artifact removal only (no template; for far channels) -------------
+
+#' Blank the saturated direct-artifact region at every pulse and interpolate it,
+#' WITHOUT template subtraction. This is the cleaning applied to channels far from
+#' the stim site, where bipolar re-referencing already removes the secondary
+#' artifact and only the (blown-out) pulse instant needs to be filled. Blanks the
+#' same rows as the template path (first `blank_width` samples + the seam sample)
+#' at each pulse onset, then fills by moving average + nearest.
+blank_direct_artifact_and_fill <- function(signal, onset_index, snip_window,
+                                           blank_width, pre = 0L,
+                                           gap_fill_window = 101L) {
+  signal <- as.numeric(signal)
+  n <- length(signal)
+  cleaned <- signal
+
+  pre <- abs(as.integer(pre))
+  win <- as.integer(snip_window)
+  n_rows <- win + 1L
+  bw <- max(0L, min(as.integer(blank_width), n_rows))
+  blank_rows <- unique(c(seq_len(bw), n_rows))       # first blank_width + seam
+  blank_rows <- blank_rows[blank_rows >= 1L & blank_rows <= n_rows]
+
+  onset_index <- as.integer(onset_index)
+  for (o in onset_index) {
+    idx <- o + (blank_rows - 1L - pre)
+    keep <- idx >= 1L & idx <= n
+    cleaned[idx[keep]] <- NA_real_
+  }
+
+  cleaned <- fill_missing_movmean(cleaned, window = gap_fill_window)
+  cleaned <- fill_missing_nearest(cleaned)
+  cleaned
+}
+
+
+# ---- Export: write cleaned bipolar back as a RAVE reference -------------------
+
+#' Export the cleaned bipolar signals as a RAVE reference, so downstream modules
+#' select `reference_name` at load time and receive the cleaned data as an
+#' ordinary re-referenced (no-stim) subject.
+#'
+#' RAVE loads a channel as `raw(electrode) - reference_signal`. To make the loaded
+#' signal equal our cleaned bipolar `clean(a-c)`, we store, for the pair's anode
+#' `a`, the reference signal `raw(a) - clean` (so `raw(a) - ref = clean`), and
+#' point the reference table at it. Reference signals are written as
+#' `reference_path/ref_<name>_<a>_<c>/<block>/voltage` filearrays (matching
+#' `ravecore::generate_reference`'s on-disk format), and the table is written to
+#' `meta/reference_<name>.csv` with columns Electrode, Group, Reference, Type.
+#'
+#' This WRITES into the subject's data directory; it is meant to be invoked
+#' explicitly (e.g. from the module's export button), not on every knit. Set
+#' `write = FALSE` to compute the reference table without touching disk.
+#'
+#' @return list(reference_name, csv, references, table)
+export_cleaned_reference <- function(subject, cleaned_signals, bipolar_pairs,
+                                     loaded_signals, block, reference_name = "cleaned",
+                                     electrode_table = NULL, write = TRUE) {
+  block <- as.character(block)
+  raw_arr <- loaded_signals[[block]]$`@impl`
+  raw_elecs <- as.integer(dimnames(raw_arr)$Electrode)
+  loaded_mat <- raw_arr[, , drop = FALSE, dimnames = FALSE]   # Time x Electrode
+
+  if (is.null(electrode_table)) { electrode_table <- subject$get_electrode_table() }
+  et <- as.data.frame(electrode_table)
+  et$Electrode <- as.integer(et$Electrode)
+  grp <- if ("LabelPrefix" %in% names(et)) as.character(et$LabelPrefix) else rep("", nrow(et))
+
+  ref_tab <- data.frame(
+    Electrode = et$Electrode, Group = grp,
+    Reference = "noref", Type = "No Reference",
+    stringsAsFactors = FALSE
+  )
+
+  written <- character(0)
+  for (nm in names(cleaned_signals)) {
+    row <- bipolar_pairs[bipolar_pairs$label == nm, , drop = FALSE]
+    if (!nrow(row)) { next }
+    a <- as.integer(row$anode[[1]]); cc <- as.integer(row$cathode[[1]])
+    ai <- match(a, raw_elecs)
+    if (is.na(ai)) { next }
+
+    cleaned <- as.numeric(cleaned_signals[[nm]]$`@impl`[drop = TRUE, dimnames = FALSE])
+    ref_sig <- as.numeric(loaded_mat[, ai]) - cleaned           # raw(a) - ref = cleaned
+    refname <- sprintf("ref_%s_%d_%d", reference_name, a, cc)
+
+    if (isTRUE(write)) {
+      sarray_path <- file.path(subject$reference_path, refname, block, "voltage")
+      if (dir.exists(sarray_path)) { unlink(sarray_path, recursive = TRUE) }
+      ravepipeline::dir_create2(dirname(sarray_path))
+      sarray <- filearray::filearray_create(
+        filebase = sarray_path, dimension = c(length(ref_sig), 1L), type = "double")
+      sarray[] <- ref_sig
+      sarray$set_header("staged", TRUE)
+      sarray$.mode <- "readonly"
+    }
+
+    ref_tab$Reference[ref_tab$Electrode == a] <- refname
+    ref_tab$Type[ref_tab$Electrode == a] <- "Bipolar Reference (stim-cleaned)"
+    written <- c(written, refname)
+  }
+
+  csv_path <- file.path(subject$meta_path, sprintf("reference_%s.csv", reference_name))
+  if (isTRUE(write)) {
+    utils::write.csv(ref_tab, csv_path, row.names = FALSE)
+  }
+  list(reference_name = reference_name, csv = csv_path,
+       references = written, table = ref_tab)
 }

@@ -88,8 +88,15 @@ common-mode noise cancel, local brain signal survives. Rules:
   (monopolar stim: skip one, e.g. stim 38 → bipolar `37-39`; **bipolar stim [Parked]:** skip
   both). A gap containing any non-stim contact is *not* bridged.
 
-### Stage 4 — Template subtraction  **[Built]**
-For each bipolar channel that still needs it:
+### Stage 4 — Two-tier secondary cleaning  **[Built]**
+Two tiers, keyed off `template_electrodes` (a pair is *near* when either contact is listed;
+`~` = all pairs near). **Every** pair gets the direct-artifact blank + interpolate
+(`blank_direct_artifact_and_fill`). *Near* pairs additionally get template subtraction; *far*
+pairs stop after bipolar + direct-artifact removal. Each cleaned trace records its method in a
+header (`bipolar+template` vs `bipolar+direct`). Verified on PAV073: `37-39`/`39-40` (near
+stim 38) → template; `1-2` (far) → direct only.
+
+For near channels the template is estimated and subtracted:
 1. **Snip** one inter-pulse window per pulse at the shared onsets.
 2. **Align** by the local min/max within a search window. The window brackets the
    secondary-artifact landmark; polarity (trough vs. crest) is chosen by larger mean
@@ -108,11 +115,16 @@ For each bipolar channel that still needs it:
 6. **Subtract** each pulse's cluster template, **write back** into the continuous trace, then
    **gap-fill** the blanked regions (moving average `gap_fill_window`, then nearest).
 
-### Export  **[Designed]**
+### Export  **[Built]**
 Write the cleaned bipolar result back as a **RAVE reference** so downstream modules select it
-at load time and receive clean data — no stim-specific handling anywhere downstream. Today the
-pipeline writes cleaned filearrays under `data/cleaned-voltage/`; the reference-export path is
-not yet built.
+at load time and receive clean data — no stim-specific handling anywhere downstream. RAVE loads
+`raw(e) − reference`, so `export_cleaned_reference` stores, for each pair's anode `a`, the
+reference `raw(a) − clean` (⇒ `raw(a) − ref = clean`) as
+`reference_path/ref_<name>_<a>_<c>/<block>/voltage` filearrays plus a `meta/reference_<name>.csv`
+table. Round-trip verified exact (`raw − stored_ref == clean`). Because it **writes into the
+subject's data directory**, it is a deliberate, user-triggered step (export button / the
+`eval=FALSE` chunk in `main.Rmd`), *not* run on knit. The full downstream-load test against the
+real subject is left for that user-triggered write.
 
 ---
 
@@ -137,7 +149,8 @@ Detection: `event_channel` (**[Built]**; `~` = auto-detect the square-wave aux c
 editable), `stim_threshold` (fallback only), `stim_frequency`, `stim_train_duration`,
 `pulse_duration`, `snip_window`.
 Alignment/template: `align_search_start`, `align_search_end`, `artifact_blank_width`,
-`template_window_pre`, `n_clusters`, `pca_n_components`.
+`template_window_pre`, `n_clusters`, `pca_n_components`, `template_electrodes` (near-stim
+contacts that get template subtraction; `~` = all pairs).
 Gap fill / export: `gap_fill_window`, `export_name`.
 
 Every core parameter lives in `settings.yaml` so `targets` rebuilds only the affected subtree
@@ -176,7 +189,8 @@ within-shaft stim-aware bipolar pairing; `ravetools::pwelch` diagnostics.
   The `stimpulse_*` epoch tables (train onsets, produced upstream by `stimpulse_finder`) are a
   *third* possible source not yet used — worth considering if epochs are always present.
 - **[Designed, not built]** Draggable alignment-window selector on the snippet plot (Shiny).
-- **[Designed, not built]** Reference-based export so downstream loads cleaned data as no-stim.
+- **[Built, round-trip verified]** Reference-based export (`export_cleaned_reference`). Remaining:
+  a real downstream-load test, which requires the user-triggered write into the subject.
 - **[Parked]** Bipolar-stim support (skip both stim contacts in pairing).
 - **[Parked]** Task-locking safety: template subtraction removes anything time-locked to the
   stim pulse. If stimulation is ever delivered at a fixed latency relative to the McGurk
@@ -190,8 +204,10 @@ within-shaft stim-aware bipolar pairing; `ravetools::pwelch` diagnostics.
 ## 9. Status summary
 
 Built and verified end-to-end: the four stages with **Events-channel-first detection** (auto
-channel 259 → 1150 pulses for PAV073 / BLOCK031) and the stim-electrode fallback, knitting to
-HTML for `McGurkStim / PAV073`, stim electrode 38, with per-section documentation and all ten
-diagnostic plots. Still designed-not-built: the alignment-window UI and reference-based export.
-The Shiny `module_*.R` / `report-stim_removal.Rmd` still reference the older block-keyed target
-shape and need realignment to the per-channel structure.
+channel 259 → 1150 pulses for PAV073 / BLOCK031) and the stim-electrode fallback, **two-tier
+cleaning** (far → bipolar + direct-artifact removal; near → + template subtraction), and the
+**reference-based export** (round-trip verified), knitting to HTML for `McGurkStim / PAV073`,
+stim electrode 38, with per-section documentation and all ten diagnostic plots. Still
+designed-not-built: the draggable alignment-window UI, and a downstream-load test of the export
+against the real subject. The Shiny `module_*.R` / `report-stim_removal.Rmd` still reference the
+older block-keyed target shape and need realignment to the per-channel structure.

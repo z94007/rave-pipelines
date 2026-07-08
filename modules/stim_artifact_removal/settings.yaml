@@ -24,6 +24,7 @@ artifact_blank_width: 20                    # leading samples blanked as the dir
 template_window_pre: 0                      # extra samples before onset included in each snippet
 n_clusters: 1                               # per-channel artifact templates (1 = MATLAB single template)
 pca_n_components: 2                         # principal components computed for the pulse scatter
+template_electrodes: '37,39,40'             # NEAR-stim contacts needing template subtraction (~ = all pairs). A bipolar pair qualifies if either contact is listed; far pairs get bipolar + direct-artifact removal only.
 
 # ---- Gap fill & export ----
 gap_fill_window: 101                        # moving-average window used to fill blanked samples (MATLAB maWin)

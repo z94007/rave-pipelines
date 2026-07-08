@@ -349,10 +349,17 @@ try({
 })
 ```
 
-# Section 4 — Template subtraction
+# Section 4 — Template subtraction (near-stim channels)
 
-For near-site channels where bipolar re-referencing leaves a residual, we remove the
-stereotyped secondary artifact directly (MATLAB L73-199). For each bipolar channel:
+The two artifacts are removed by two tiers of cleaning. **Every** bipolar channel has its
+saturated **direct** artifact blanked and interpolated (it rails on all channels and carries
+no usable signal). The **secondary** rebound is handled by tier: channels **far** from the
+stim site are already clean after bipolar re-referencing and need nothing more, while channels
+**near** the site need per-pulse **template subtraction**. You pick the near channels via
+`template_electrodes` (a pair qualifies when either contact is listed) — typically guided by
+the Section 3 periodogram; `~` treats all pairs as near.
+
+For near channels the template is estimated and subtracted (MATLAB L73-199):
 
 1. **Snip & align.** Cut one inter-pulse window per pulse at the detected onsets, then
    align them by their dominant local extremum in rows `align_search_start:align_search_end`
@@ -372,6 +379,10 @@ stereotyped secondary artifact directly (MATLAB L73-199). For each bipolar chann
    rows, write the corrected snippets back into the continuous trace (leaving the blanked
    region as `NA`), then fill those gaps with a centered moving average
    (`gap_fill_window`) followed by nearest-value for any edge residue.
+
+Far channels skip steps 3-5: they get only the direct-artifact blank + interpolation
+(`blank_direct_artifact_and_fill`). The per-channel cleaning method is recorded on each
+cleaned trace's header (`bipolar+template` vs `bipolar+direct`).
 
 ```{rave build_snippets, language = "R", export = "snippet_list"}
 block <- as.character(analysis_block)
@@ -468,37 +479,61 @@ if (length(aligned_pulse_list)) {
 ```{rave clean_signals, language = "R", export = "cleaned_signals"}
 block <- as.character(analysis_block)
 gap_win <- as.integer(gap_fill_window)
+blank_width <- as.integer(artifact_blank_width)
 filearray_root <- file.path(pipeline$pipeline_path, "data", "cleaned-voltage")
 
+# Two-tier: EVERY channel gets direct-artifact blank + interpolate; template
+# subtraction runs only on the near-stim channels. A pair is "near" when either
+# contact is in `template_electrodes` (blank => all pairs are near).
+te <- dipsaus::parse_svec(template_electrodes)
+pair_is_near <- function(lab) {
+  if (!length(te)) { return(TRUE) }
+  row <- bipolar_pairs[bipolar_pairs$label == lab, , drop = FALSE]
+  if (!nrow(row)) { return(TRUE) }
+  isTRUE(row$anode[[1]] %in% te) || isTRUE(row$cathode[[1]] %in% te)
+}
+
 cleaned_signals <- list()
-if (length(template_list) && !is.null(bipolar_signals)) {
+if (length(aligned_pulse_list) && !is.null(bipolar_signals)) {
   barr <- bipolar_signals$`@impl`
-  labs <- names(template_list)
+  labs <- names(aligned_pulse_list)
   time <- as.numeric(dimnames(barr)$Time)
 
   cleaned_signals <- structure(
     names = labs,
     lapply(seq_along(labs), function(j) {
-      tmpl <- template_list[[j]]
+      lab <- labs[[j]]
       al <- aligned_pulse_list[[j]]
+      tmpl <- template_list[[lab]]
       trace <- barr[, j, drop = TRUE, dimnames = FALSE]
-      if (is.null(tmpl) || !isTRUE(al$n_pulses > 0)) {
+
+      near <- pair_is_near(lab)
+      if (!isTRUE(al$n_pulses > 0)) {
         cleaned <- as.numeric(trace)
-      } else {
+        method <- "none"
+      } else if (near && !is.null(tmpl)) {
         cleaned <- subtract_cluster_templates_and_fill(
           signal = trace, snips = al$snips, onset_index = al$onset_index,
           pre = al$pre, cluster_templates = tmpl$cluster_templates,
           gap_fill_window = gap_win
         )
+        method <- "bipolar+template"
+      } else {
+        cleaned <- blank_direct_artifact_and_fill(
+          signal = trace, onset_index = al$onset_index, snip_window = al$snip_window,
+          blank_width = blank_width, pre = al$pre, gap_fill_window = gap_win
+        )
+        method <- "bipolar+direct"
       }
+
       new_rave_filearray(
-        filebase = file.path(filearray_root, sprintf("%s_%s", block, labs[[j]])),
+        filebase = file.path(filearray_root, sprintf("%s_%s", block, lab)),
         data = matrix(cleaned, ncol = 1L),
-        dimnames_list = list(Time = time, Electrode = labs[[j]]),
+        dimnames_list = list(Time = time, Electrode = lab),
         headers = list(
-          block = block, channel = labs[[j]],
+          block = block, channel = lab,
           sample_rate = barr$get_header("sample_rate"),
-          n_pulses = al$n_pulses, cleaning_method = "template_subtraction"
+          n_pulses = al$n_pulses, cleaning_method = method
         )
       )
     })
@@ -624,6 +659,35 @@ try({
     )
   }
 })
+```
+
+# Export — write the cleaned data back as a reference
+
+The point of this pipeline is that the cleaned recording can be analyzed **exactly like a
+no-stim recording**. RAVE achieves that through the reference system: a downstream module
+loads a channel as `raw(electrode) − reference`, so we store, for each bipolar pair's anode,
+the reference `raw(anode) − cleaned`. Then selecting this reference at load time yields the
+cleaned bipolar signal — no stim-specific handling anywhere downstream.
+
+`export_cleaned_reference()` writes the reference signals to
+`reference_path/ref_<name>_<a>_<c>/<block>/voltage` (the same on-disk format as
+`ravecore::generate_reference`) and the reference table to `meta/reference_<name>.csv`. This
+**writes into the subject's data directory**, so it is a deliberate, user-triggered step (the
+module's export button), *not* something the knit does automatically — hence the chunk below is
+`eval = FALSE`. Run it (or press Export in the app) once you are happy with the cleaning.
+
+```{r export, eval=FALSE}
+export_cleaned_reference(
+  subject         = subject,
+  cleaned_signals = cleaned_signals,
+  bipolar_pairs   = bipolar_pairs,
+  loaded_signals  = loaded_signals,
+  block           = analysis_block,
+  reference_name  = export_name
+)
+# Downstream then loads the cleaned data as an ordinary re-referenced subject, e.g.
+#   ravecore::prepare_subject_raw_voltage_with_blocks(
+#     subject, electrodes = <anodes>, reference_name = export_name)
 ```
 
 # Build, Visualize, & Run
